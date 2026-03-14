@@ -21,10 +21,13 @@ INITIAL_CAPITAL    = 500.0        # Startkapital in €
 MIN_CONFIDENCE     = 51           # Mindest-Konfidenz für Trade (%)
 INVEST_FRACTION    = 0.25         # Max 25% des Kapitals pro Trade
 CYCLE_SECONDS      = 5            # Analyse-Zyklus in Sekunden
+MIN_HOLD_SECONDS   = 60           # Mindest-Haltezeit in Sekunden
+STOP_LOSS_PCT      = 0.03          # Stop-Loss bei 3% Verlust
+TAKE_PROFIT_PCT    = 0.05          # Take-Profit bei 5% Gewinn
 HISTORY_SIZE       = 100          # Preishistorie pro Paar
-BRAIN_FILE         = "brain.json" # Lern-Datei
-PORTFOLIO_FILE     = "portfolio.json"
-LOG_FILE           = "trading.log"
+BRAIN_FILE         = "/data/brain.json" # Lern-Datei
+PORTFOLIO_FILE     = "/data/portfolio.json"
+LOG_FILE           = "/data/trading.log"
 
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -35,6 +38,10 @@ PAIRS = [
     "LINK/USDT", "LTC/USDT", "UNI/USDT", "ATOM/USDT", "TRX/USDT"
 ]
 SYMBOLS = {p: p.replace("/", "").lower() for p in PAIRS}
+
+# ── Persistenter Speicher ─────────────────────────────────
+import os
+os.makedirs("/data", exist_ok=True)
 
 # ── Logging ────────────────────────────────────────────
 logging.basicConfig(
@@ -224,10 +231,16 @@ class Portfolio:
         self.save()
         return True, invest
 
-    def sell(self, pair: str, price: float, confidence: int, reason: str):
+    def sell(self, pair: str, price: float, confidence: int, reason: str, force: bool = False):
         if pair not in self.positions:
             return False, 0, 0, {}
         pos = self.positions[pair]
+        hold_time = time.time() - pos.get("entry_time", 0)
+        # Stop-Loss & Take-Profit bypass hold time check
+        if not force and hold_time < MIN_HOLD_SECONDS:
+            remaining = int(MIN_HOLD_SECONDS - hold_time)
+            log.debug(f"⏳ {pair}: Mindest-Haltezeit nicht erreicht ({remaining}s verbleibend)")
+            return False, 0, 0, {}
         sale_value = pos["amount"] * price
         pnl = sale_value - pos["amount"] * pos["avg_price"]
         indicators = pos.get("indicators", {})
@@ -241,6 +254,19 @@ class Portfolio:
         del self.positions[pair]
         self.save()
         return True, sale_value, pnl, indicators
+
+    def check_stop_take(self, pair: str, current_price: float):
+        """Prüft Stop-Loss und Take-Profit für eine Position"""
+        if pair not in self.positions:
+            return None, None
+        pos = self.positions[pair]
+        avg = pos["avg_price"]
+        change_pct = (current_price - avg) / avg
+        if change_pct <= -STOP_LOSS_PCT:
+            return "STOP_LOSS", change_pct
+        if change_pct >= TAKE_PROFIT_PCT:
+            return "TAKE_PROFIT", change_pct
+        return None, None
 
 # ── Analyse Engine ─────────────────────────────────────
 def analyze(pair: str, prices_data: dict, history: list, portfolio: Portfolio, brain: Brain) -> dict:
@@ -351,6 +377,37 @@ async def send_telegram(msg: str):
     except Exception as e:
         log.warning(f"Telegram Fehler: {e}")
 
+async def send_brain_backup(brain: 'Brain', portfolio: 'Portfolio'):
+    """Sendet brain.json und portfolio.json als Datei an Telegram"""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        import io
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
+        brain_data = json.dumps({
+            "weights": brain.weights,
+            "total_trades": brain.total_trades,
+            "wins": brain.wins,
+            "losses": brain.losses,
+            "total_pnl": brain.total_pnl,
+            "history": brain.history[-200:]
+        }, indent=2).encode("utf-8")
+        async with aiohttp.ClientSession() as session:
+            form = aiohttp.FormData()
+            form.add_field("chat_id", TELEGRAM_CHAT_ID)
+            form.add_field("caption",
+                f"🧠 Brain Backup\nTrades: {brain.total_trades} | Winrate: {brain.win_rate:.1f}%\nPnL gesamt: €{brain.total_pnl:+.2f}\nCash: €{portfolio.cash:.2f}",
+                content_type="text/plain")
+            form.add_field("parse_mode", "HTML")
+            form.add_field("document",
+                io.BytesIO(brain_data),
+                filename="cryptomind_brain.json",
+                content_type="application/json")
+            await session.post(url, data=form)
+        log.info("🧠 Brain Backup an Telegram gesendet")
+    except Exception as e:
+        log.warning(f"Brain Backup Fehler: {e}")
+
 # ── Hauptbot ───────────────────────────────────────────
 class CryptoMindBot:
     def __init__(self):
@@ -399,7 +456,7 @@ class CryptoMindBot:
                 await asyncio.sleep(5)
 
     async def trading_loop(self):
-        log.info(f"🤖 Trading-Loop gestartet | Zyklus: {CYCLE_SECONDS}s | Min. Konfidenz: {MIN_CONFIDENCE}%")
+        log.info(f"🤖 Trading-Loop gestartet | Zyklus: {CYCLE_SECONDS}s | Min. Konfidenz: {MIN_CONFIDENCE}% | Mindest-Haltezeit: {MIN_HOLD_SECONDS}s")
         await asyncio.sleep(5)  # Warte auf erste Preise
 
         while self.running:
@@ -421,12 +478,38 @@ class CryptoMindBot:
                 reason = result["reason"]
                 price = result["price"]
 
+                # ── Stop-Loss / Take-Profit Check ──
+                sl_trigger, sl_pct = self.portfolio.check_stop_take(pair, price)
+                if sl_trigger:
+                    sl_reason = f"🛑 Stop-Loss {sl_pct*100:.1f}%" if sl_trigger == "STOP_LOSS" else f"🎯 Take-Profit +{sl_pct*100:.1f}%"
+                    success, value, pnl, indicators = self.portfolio.sell(pair, price, 100, sl_reason, force=True)
+                    if success:
+                        # Brain lernt aus Stop-Loss/Take-Profit mit extra Gewicht
+                        self.brain.learn(indicators, pnl, pair, self.portfolio.trades[-1]["price"] if self.portfolio.trades else price, price)
+                        # Stop-Loss extra bestrafen / Take-Profit extra belohnen
+                        if sl_trigger == "STOP_LOSS":
+                            for key in indicators:
+                                if key in self.brain.weights:
+                                    self.brain.weights[key] = max(0.1, self.brain.weights[key] - 0.08)
+                            self.brain.save()
+                            emoji = "🛑"
+                            log.info(f"🛑 STOP {pair:<12} | €{value:.2f} | PnL: {pnl:+.2f}€ | {sl_pct*100:.1f}% Verlust")
+                            await send_telegram(f"🛑 <b>STOP-LOSS {pair}</b>\n💰 €{value:.2f} @ ${price:.4f}\n❌ PnL: €{pnl:+.2f} ({sl_pct*100:.1f}%)\n🧠 Brain lernt daraus")
+                        else:
+                            for key in indicators:
+                                if key in self.brain.weights:
+                                    self.brain.weights[key] = min(3.0, self.brain.weights[key] + 0.08)
+                            self.brain.save()
+                            log.info(f"🎯 TAKE {pair:<12} | €{value:.2f} | PnL: {pnl:+.2f}€ | +{sl_pct*100:.1f}% Gewinn")
+                            await send_telegram(f"🎯 <b>TAKE-PROFIT {pair}</b>\n💰 €{value:.2f} @ ${price:.4f}\n✅ PnL: €{pnl:+.2f} (+{sl_pct*100:.1f}%)\n🧠 Brain lernt daraus")
+                    continue
+
+                # ── Normales Signal ──
                 if conf >= MIN_CONFIDENCE and sig == "BUY":
                     success, invested = self.portfolio.buy(pair, price, conf, reason, result["indicators"])
                     if success:
-                        msg = f"🟢 GEKAUFT {pair}\n💰 €{invested:.2f} @ ${price:.4f}\n📊 RSI: {result['rsi']} | {reason}\n🎯 Konfidenz: {conf}%"
                         log.info(f"🟢 BUY  {pair:<12} | €{invested:.2f} @ ${price:.4f} | {conf}% | {reason}")
-                        await send_telegram(f"🟢 <b>GEKAUFT {pair}</b>\n💰 €{invested:.2f} @ ${price:.4f}\n📊 {reason} | {conf}% Konfidenz")
+                        await send_telegram(f"🟢 <b>GEKAUFT {pair}</b>\n💰 €{invested:.2f} @ ${price:.4f}\n📊 {reason} | {conf}% Konfidenz\n🛑 Stop: -{STOP_LOSS_PCT*100:.0f}% | 🎯 Profit: +{TAKE_PROFIT_PCT*100:.0f}%")
 
                 elif conf >= MIN_CONFIDENCE and sig == "SELL":
                     success, value, pnl, indicators = self.portfolio.sell(pair, price, conf, reason)
@@ -451,7 +534,7 @@ class CryptoMindBot:
             await asyncio.sleep(max(0, CYCLE_SECONDS - elapsed))
 
     async def status_report(self):
-        """Sendet alle 6 Stunden einen Status-Report via Telegram"""
+        """Sendet alle 6 Stunden einen Status-Report + Brain Backup via Telegram"""
         while self.running:
             await asyncio.sleep(6 * 3600)
             if not self.running:
@@ -469,6 +552,8 @@ class CryptoMindBot:
                 f"📌 Positionen:\n{pos_text}"
             )
             await send_telegram(msg)
+            # Brain Backup als Datei senden
+            await send_brain_backup(self.brain, self.portfolio)
 
     async def run(self):
         self.running = True
