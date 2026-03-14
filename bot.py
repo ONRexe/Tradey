@@ -90,15 +90,83 @@ def calc_macd_histogram(prices: list) -> float:
     signal = calc_ema(macd_line[-9:], 9)
     return macd_line[-1] - signal[-1]
 
+# ── Neue Indikatoren ──────────────────────────────────────
+
+def calc_bollinger(prices: list, period: int = 20) -> dict:
+    """Bollinger Bänder – zeigt ob Preis über/unter normalem Bereich"""
+    if len(prices) < period:
+        return {"upper": 0, "lower": 0, "mid": 0, "pct": 0.5}
+    recent = prices[-period:]
+    mid = sum(recent) / period
+    std = (sum((p - mid)**2 for p in recent) / period) ** 0.5
+    upper = mid + 2 * std
+    lower = mid - 2 * std
+    price = prices[-1]
+    pct = (price - lower) / (upper - lower) if upper != lower else 0.5
+    return {"upper": upper, "lower": lower, "mid": mid, "pct": pct}
+
+def calc_stochastic(prices: list, period: int = 14) -> float:
+    """Stochastic Oscillator – wie RSI aber anders berechnet (0-100)"""
+    if len(prices) < period:
+        return 50.0
+    recent = prices[-period:]
+    low, high = min(recent), max(recent)
+    if high == low:
+        return 50.0
+    return (prices[-1] - low) / (high - low) * 100
+
+def calc_volume_trend(volumes: list) -> float:
+    """Volumen-Trend – steigendes Volumen bestätigt Preisbewegung"""
+    if len(volumes) < 5:
+        return 1.0
+    recent = volumes[-5:]
+    avg = sum(recent) / len(recent)
+    return recent[-1] / avg if avg > 0 else 1.0
+
+def calc_trend_strength(prices: list, period: int = 10) -> float:
+    """Trendstärke – wie stark und konsistent ist der aktuelle Trend"""
+    if len(prices) < period:
+        return 0.0
+    recent = prices[-period:]
+    ups = sum(1 for i in range(1, len(recent)) if recent[i] > recent[i-1])
+    return (ups / (period - 1)) * 2 - 1  # -1 (starker Abwärtstrend) bis +1 (starker Aufwärtstrend)
+
+def calc_price_position(prices: list, period: int = 20) -> float:
+    """Wo steht der Preis im Vergleich zu den letzten N Kerzen (0=Tief, 1=Hoch)"""
+    if len(prices) < period:
+        return 0.5
+    recent = prices[-period:]
+    low, high = min(recent), max(recent)
+    return (prices[-1] - low) / (high - low) if high != low else 0.5
+
 # ── Brain (Lern-System) ────────────────────────────────
 class Brain:
     DEFAULT_WEIGHTS = {
+        # RSI
         "rsi_oversold": 1.0,
         "rsi_low": 1.0,
         "rsi_overbought": 1.0,
+        # MACD
         "macd_positive": 1.0,
+        "macd_negative": 1.0,
+        # Momentum
         "momentum_up": 1.0,
         "momentum_down": 1.0,
+        # Bollinger
+        "bb_oversold": 1.0,      # Preis unter unterem Band
+        "bb_overbought": 1.0,    # Preis über oberem Band
+        "bb_mid_cross": 1.0,     # Preis kreuzt Mittellinie
+        # Stochastic
+        "stoch_oversold": 1.0,   # Stoch < 20
+        "stoch_overbought": 1.0, # Stoch > 80
+        # Trend
+        "trend_strong_up": 1.0,  # Starker Aufwärtstrend
+        "trend_strong_down": 1.0,# Starker Abwärtstrend
+        # Volumen
+        "volume_spike": 1.0,     # Volumen-Spike bestätigt Signal
+        # Exit-Optimierung
+        "hold_short": 1.0,       # Kurze Haltezeit war profitabel
+        "hold_long": 1.0,        # Lange Haltezeit war profitabel
     }
 
     def __init__(self):
@@ -139,12 +207,28 @@ class Brain:
         except Exception as e:
             log.warning(f"Brain speichern fehlgeschlagen: {e}")
 
-    def learn(self, indicators: dict, pnl: float, pair: str, entry: float, exit_price: float):
+    def learn(self, indicators: dict, pnl: float, pair: str, entry: float, exit_price: float, hold_seconds: float = 0):
         won = pnl > 0
         delta = 0.05 if won else -0.04
         for key in indicators:
             if key in self.weights:
                 self.weights[key] = max(0.1, min(3.0, self.weights[key] + delta))
+
+        # Lerne optimale Haltezeit
+        if hold_seconds > 0:
+            if won:
+                if hold_seconds < 90:
+                    # Kurze Haltezeit war profitabel
+                    self.weights["hold_short"] = min(3.0, self.weights.get("hold_short", 1.0) + 0.05)
+                else:
+                    # Lange Haltezeit war profitabel
+                    self.weights["hold_long"] = min(3.0, self.weights.get("hold_long", 1.0) + 0.05)
+            else:
+                if hold_seconds < 90:
+                    self.weights["hold_short"] = max(0.1, self.weights.get("hold_short", 1.0) - 0.04)
+                else:
+                    self.weights["hold_long"] = max(0.1, self.weights.get("hold_long", 1.0) - 0.04)
+
         # Schutz: Wenn alle Gewichte zu niedrig → auf 0.5 zurücksetzen
         avg_weight = sum(self.weights.values()) / len(self.weights)
         if avg_weight < 0.3:
@@ -255,12 +339,14 @@ class Portfolio:
         pnl = sale_value - pos["amount"] * pos["avg_price"]
         indicators = pos.get("indicators", {})
         self.cash += sale_value
-        self.trades.append({
+        trade_entry = {
             "pair": pair, "type": "SELL", "price": price,
             "amount": pos["amount"], "value": sale_value,
             "pnl": round(pnl, 4), "confidence": confidence,
             "reason": reason, "time": datetime.now().strftime("%H:%M:%S")
-        })
+        }
+        self.trades.append(trade_entry)
+        self._session_trades.append(trade_entry)
         del self.positions[pair]
         self.save()
         return True, sale_value, pnl, indicators
@@ -295,49 +381,97 @@ def analyze(pair: str, prices_data: dict, history: list, portfolio: Portfolio, b
 
     rsi = calc_rsi(history)
     macd_hist = calc_macd_histogram(history)
+    bb = calc_bollinger(history)
+    stoch = calc_stochastic(history)
+    trend = calc_trend_strength(history)
+    price_pos = calc_price_position(history)
+    vol_data = prices_data.get(pair, {})
+    vol_trend = calc_volume_trend([vol_data.get("volume", 1)] * 5)
 
-    # RSI
-    if rsi < 35:
-        score += 30 * w["rsi_oversold"]
+    # ── RSI ──
+    if rsi < 30:
+        score += 35 * w.get("rsi_oversold", 1.0)
+        reasons.append("RSI stark überverkauft")
+        indicators["rsi_oversold"] = True
+    elif rsi < 40:
+        score += 20 * w.get("rsi_oversold", 1.0)
         reasons.append("RSI überverkauft")
         indicators["rsi_oversold"] = True
-    elif rsi < 45:
-        score += 15 * w["rsi_low"]
+    elif rsi < 50:
+        score += 10 * w.get("rsi_low", 1.0)
         reasons.append("RSI niedrig")
         indicators["rsi_low"] = True
-    elif rsi > 65:
-        score -= 30 * w["rsi_overbought"]
+    elif rsi > 70:
+        score -= 35 * w.get("rsi_overbought", 1.0)
+        reasons.append("RSI stark überkauft")
+        indicators["rsi_overbought"] = True
+    elif rsi > 60:
+        score -= 20 * w.get("rsi_overbought", 1.0)
         reasons.append("RSI überkauft")
         indicators["rsi_overbought"] = True
-    elif rsi > 55:
-        score -= 15
-        reasons.append("RSI hoch")
 
-    # MACD
+    # ── MACD ──
     if macd_hist > 0:
-        score += 20 * w["macd_positive"]
+        score += 20 * w.get("macd_positive", 1.0)
         reasons.append("MACD positiv")
         indicators["macd_positive"] = True
     else:
-        score -= 20
+        score -= 20 * w.get("macd_negative", 1.0)
         reasons.append("MACD negativ")
+        indicators["macd_negative"] = True
 
-    # Momentum
+    # ── Bollinger Bänder ──
+    if bb["pct"] < 0.1:
+        score += 25 * w.get("bb_oversold", 1.0)
+        reasons.append("Bollinger überverkauft")
+        indicators["bb_oversold"] = True
+    elif bb["pct"] > 0.9:
+        score -= 25 * w.get("bb_overbought", 1.0)
+        reasons.append("Bollinger überkauft")
+        indicators["bb_overbought"] = True
+    elif 0.45 < bb["pct"] < 0.55:
+        score += 5 * w.get("bb_mid_cross", 1.0)
+        indicators["bb_mid_cross"] = True
+
+    # ── Stochastic ──
+    if stoch < 20:
+        score += 20 * w.get("stoch_oversold", 1.0)
+        reasons.append("Stoch überverkauft")
+        indicators["stoch_oversold"] = True
+    elif stoch > 80:
+        score -= 20 * w.get("stoch_overbought", 1.0)
+        reasons.append("Stoch überkauft")
+        indicators["stoch_overbought"] = True
+
+    # ── Trendstärke ──
+    if trend > 0.6:
+        score += 15 * w.get("trend_strong_up", 1.0)
+        reasons.append("Starker Aufwärtstrend")
+        indicators["trend_strong_up"] = True
+    elif trend < -0.6:
+        score -= 15 * w.get("trend_strong_down", 1.0)
+        reasons.append("Starker Abwärtstrend")
+        indicators["trend_strong_down"] = True
+
+    # ── Momentum (kurzfristig) ──
     if len(history) >= 5:
         momentum = (history[-1] - history[-5]) / history[-5] * 100
         if momentum > 0.3:
-            score += 15 * w["momentum_up"]
-            reasons.append("Aufwärtstrend")
+            score += 12 * w.get("momentum_up", 1.0)
             indicators["momentum_up"] = True
         elif momentum < -0.3:
-            score -= 15 * w["momentum_down"]
-            reasons.append("Abwärtstrend")
+            score -= 12 * w.get("momentum_down", 1.0)
             indicators["momentum_down"] = True
 
-    # 24h Change
-    if change > 2:
+    # ── Volumen bestätigt Signal ──
+    if vol_trend > 1.5:
+        score *= 1.1  # 10% Boost wenn Volumen hoch
+        indicators["volume_spike"] = True
+
+    # ── 24h Change ──
+    if change > 3:
         score += 10
-    elif change < -2:
+    elif change < -3:
         score -= 10
 
     # Position management
@@ -495,7 +629,8 @@ class CryptoMindBot:
                     success, value, pnl, indicators = self.portfolio.sell(pair, price, 100, sl_reason, force=True)
                     if success:
                         # Brain lernt aus Stop-Loss/Take-Profit mit extra Gewicht
-                        self.brain.learn(indicators, pnl, pair, self.portfolio.trades[-1]["price"] if self.portfolio.trades else price, price)
+                        sl_hold = time.time() - self.portfolio.trades[-1].get("entry_time", time.time()) if self.portfolio.trades else 0
+                        self.brain.learn(indicators, pnl, pair, self.portfolio.trades[-1]["price"] if self.portfolio.trades else price, price, sl_hold)
                         # Stop-Loss extra bestrafen / Take-Profit extra belohnen
                         if sl_trigger == "STOP_LOSS":
                             for key in indicators:
@@ -522,12 +657,14 @@ class CryptoMindBot:
                         await send_telegram(f"🟢 <b>GEKAUFT {pair}</b>\n💰 €{invested:.2f} @ ${price:.4f}\n📊 {reason} | {conf}% Konfidenz\n🛑 Stop: -{STOP_LOSS_PCT*100:.0f}% | 🎯 Profit: +{TAKE_PROFIT_PCT*100:.0f}%")
 
                 elif conf >= MIN_CONFIDENCE and sig == "SELL":
+                    pos = self.portfolio.positions.get(pair)
+                    hold_secs = time.time() - pos.get("entry_time", time.time()) if pos else 0
                     success, value, pnl, indicators = self.portfolio.sell(pair, price, conf, reason)
                     if success:
-                        self.brain.learn(indicators, pnl, pair, self.prices[pair]["current"], price)
+                        self.brain.learn(indicators, pnl, pair, self.prices[pair]["current"], price, hold_secs)
                         emoji = "✅" if pnl >= 0 else "❌"
-                        log.info(f"🔴 SELL {pair:<12} | €{value:.2f} | PnL: {pnl:+.2f}€ | {conf}% | {reason}")
-                        await send_telegram(f"🔴 <b>VERKAUFT {pair}</b>\n💰 €{value:.2f} @ ${price:.4f}\n{emoji} PnL: €{pnl:+.2f}\n📊 {reason}")
+                        log.info(f"🔴 SELL {pair:<12} | €{value:.2f} | PnL: {pnl:+.2f}€ | {conf}% | {reason} | Haltezeit: {int(hold_secs)}s")
+                        await send_telegram(f"🔴 <b>VERKAUFT {pair}</b>\n💰 €{value:.2f} @ ${price:.4f}\n{emoji} PnL: €{pnl:+.2f}\n📊 {reason} | {int(hold_secs)}s gehalten")
 
             # Status alle 60 Zyklen loggen
             if hasattr(self, '_cycle_count'):
@@ -544,25 +681,42 @@ class CryptoMindBot:
             await asyncio.sleep(max(0, CYCLE_SECONDS - elapsed))
 
     async def status_report(self):
-        """Sendet alle 6 Stunden einen Status-Report + Brain Backup via Telegram"""
+        """Sendet alle 15 Minuten einen kompakten Status-Report via Telegram"""
         while self.running:
-            await asyncio.sleep(6 * 3600)
+            await asyncio.sleep(15 * 60)
             if not self.running:
                 break
             total = self.portfolio.total_value(self.prices)
+            start_capital = self.portfolio.trades[0]["value"] if self.portfolio.trades else INITIAL_CAPITAL
             pnl = total - INITIAL_CAPITAL
             pnl_pct = (pnl / INITIAL_CAPITAL) * 100
-            pos_text = "\n".join([f"  • {p}: {v['amount']:.4f}" for p, v in self.portfolio.positions.items()]) or "  Keine"
+
+            # Bester und schlechtester Trade der letzten 15 Minuten
+            recent = self.portfolio._session_trades[-50:]  # max letzte 50
+            self.portfolio._session_trades = []  # reset für nächsten Zyklus
+
+            best = max(recent, key=lambda t: t["pnl"], default=None)
+            worst = min(recent, key=lambda t: t["pnl"], default=None)
+
+            best_txt = f"👍 <b>Bester Trade:</b> {best['pair']} {'+' if best['pnl']>=0 else ''}€{best['pnl']:.2f}" if best else "👍 Kein Trade"
+            worst_txt = f"👎 <b>Schlechtester:</b> {worst['pair']} {'+' if worst['pnl']>=0 else ''}€{worst['pnl']:.2f}" if worst else "👎 Kein Trade"
+
             msg = (
-                f"📊 <b>CryptoMind Status-Report</b>\n\n"
-                f"💼 Kapital: €{total:.2f}\n"
-                f"{'📈' if pnl>=0 else '📉'} PnL: €{pnl:+.2f} ({pnl_pct:+.1f}%)\n"
-                f"💵 Cash: €{self.portfolio.cash:.2f}\n"
-                f"🧠 Winrate: {self.brain.win_rate:.1f}% ({self.brain.total_trades} Trades)\n"
-                f"📌 Positionen:\n{pos_text}"
+                f"⚠️ <b>CryptoMind Status-Report</b>\n\n"
+                f"💲 <b>Kapital:</b> €{total:.2f}\n"
+                f"{'📈' if pnl>=0 else '📉'} <b>PnL gesamt:</b> €{pnl:+.2f} ({pnl_pct:+.1f}%)\n"
+                f"📊 <b>Winrate:</b> {self.brain.win_rate:.1f}% ({self.brain.total_trades} Trades)\n\n"
+                f"{best_txt}\n"
+                f"{worst_txt}"
             )
             await send_telegram(msg)
-            # Brain Backup als Datei senden
+
+    async def brain_backup_loop(self):
+        """Sendet alle 2 Stunden die Brain-Datei via Telegram"""
+        while self.running:
+            await asyncio.sleep(2 * 3600)
+            if not self.running:
+                break
             await send_brain_backup(self.brain, self.portfolio)
 
     async def run(self):
@@ -574,7 +728,8 @@ class CryptoMindBot:
         await asyncio.gather(
             self.connect_binance(),
             self.trading_loop(),
-            self.status_report()
+            self.status_report(),
+            self.brain_backup_loop()
         )
 
 # ── Start ──────────────────────────────────────────────
