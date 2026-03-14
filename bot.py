@@ -20,8 +20,8 @@ import aiohttp
 INITIAL_CAPITAL    = 500.0        # Startkapital in €
 MIN_CONFIDENCE     = 51           # Mindest-Konfidenz für Trade (%)
 INVEST_FRACTION    = 0.25         # Max 25% des Kapitals pro Trade
-CYCLE_SECONDS      = 5            # Analyse-Zyklus in Sekunden
-MIN_HOLD_SECONDS   = 60           # Mindest-Haltezeit in Sekunden
+CYCLE_SECONDS      = 15           # Analyse-Zyklus in Sekunden
+MIN_HOLD_SECONDS   = 60           # Mindest-Haltezeit 1 Minute
 STOP_LOSS_PCT      = 0.03          # Stop-Loss bei 3% Verlust
 TAKE_PROFIT_PCT    = 0.05          # Take-Profit bei 5% Gewinn
 HISTORY_SIZE       = 100          # Preishistorie pro Paar
@@ -188,6 +188,10 @@ class Portfolio:
                 self.cash = data.get("cash", INITIAL_CAPITAL)
                 self.positions = data.get("positions", {})
                 self.trades = data.get("trades", [])
+                # Stelle sicher dass alle Positionen eine entry_time haben
+                for pair, pos in self.positions.items():
+                    if "entry_time" not in pos:
+                        pos["entry_time"] = time.time() - MIN_HOLD_SECONDS  # sofort handelbar
                 log.info(f"💼 Portfolio geladen: €{self.cash:.2f} Cash, {len(self.positions)} Positionen")
         except Exception as e:
             log.warning(f"Portfolio laden fehlgeschlagen: {e}")
