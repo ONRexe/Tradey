@@ -18,10 +18,12 @@ import aiohttp
 
 # ── Konfiguration ──────────────────────────────────────
 INITIAL_CAPITAL    = 500.0        # Startkapital in €
-MIN_CONFIDENCE     = 51           # Mindest-Konfidenz für Trade (%)
+MIN_CONFIDENCE     = 65           # Mindest-Konfidenz für Trade (%)
 INVEST_FRACTION    = 0.25         # Max 25% des Kapitals pro Trade
-CYCLE_SECONDS      = 15           # Analyse-Zyklus in Sekunden
-MIN_HOLD_SECONDS   = 60           # Mindest-Haltezeit 1 Minute
+CYCLE_SECONDS      = 300          # Analyse-Zyklus 5 Minuten
+MIN_HOLD_SECONDS   = 900          # Mindest-Haltezeit 15 Minuten
+MAX_POSITIONS      = 5            # Max gleichzeitige Positionen
+TRADING_FEE        = 0.001         # Binance Fee 0.1% pro Trade
 STOP_LOSS_PCT      = 0.03          # Stop-Loss bei 3% Verlust
 TAKE_PROFIT_PCT    = 0.05          # Take-Profit bei 5% Gewinn
 HISTORY_SIZE       = 100          # Preishistorie pro Paar
@@ -139,6 +141,96 @@ def calc_price_position(prices: list, period: int = 20) -> float:
     low, high = min(recent), max(recent)
     return (prices[-1] - low) / (high - low) if high != low else 0.5
 
+# ── Trend-Erkennung ───────────────────────────────────────
+
+def calc_ema_cross(prices: list) -> str:
+    """EMA 9/21 Kreuzung – klassisches Trendsignal"""
+    if len(prices) < 22:
+        return "neutral"
+    from collections import deque
+    def ema(data, p):
+        k = 2/(p+1)
+        e = [data[0]]
+        for v in data[1:]: e.append(v*k + e[-1]*(1-k))
+        return e
+    e9 = ema(prices, 9)
+    e21 = ema(prices, 21)
+    # Aktuelle Kreuzung
+    if e9[-1] > e21[-1] and e9[-2] <= e21[-2]:
+        return "cross_up"    # Gerade gekreuzt: bullisch
+    if e9[-1] < e21[-1] and e9[-2] >= e21[-2]:
+        return "cross_down"  # Gerade gekreuzt: bärisch
+    if e9[-1] > e21[-1]:
+        return "above"       # EMA9 über EMA21: Aufwärtstrend
+    return "below"           # EMA9 unter EMA21: Abwärtstrend
+
+def calc_higher_highs_lower_lows(prices: list, lookback: int = 10) -> str:
+    """Erkennt Höhere Hochs / Tiefere Tiefs – Trendbestätigung"""
+    if len(prices) < lookback * 2:
+        return "neutral"
+    first_half = prices[-lookback*2:-lookback]
+    second_half = prices[-lookback:]
+    high1, low1 = max(first_half), min(first_half)
+    high2, low2 = max(second_half), min(second_half)
+    if high2 > high1 and low2 > low1:
+        return "higher_highs"   # Aufwärtstrend bestätigt
+    if high2 < high1 and low2 < low1:
+        return "lower_lows"     # Abwärtstrend bestätigt
+    return "neutral"
+
+def calc_breakout(prices: list, lookback: int = 20) -> str:
+    """Erkennt Ausbrüche über Widerstand oder unter Support"""
+    if len(prices) < lookback + 2:
+        return "neutral"
+    recent = prices[-(lookback+2):-2]  # historische Werte
+    resistance = max(recent)
+    support = min(recent)
+    current = prices[-1]
+    prev = prices[-2]
+    range_size = resistance - support
+    if range_size == 0:
+        return "neutral"
+    # Ausbruch nur wenn vorher innerhalb der Range
+    if current > resistance * 1.005 and prev <= resistance:
+        return "breakout_up"
+    if current < support * 0.995 and prev >= support:
+        return "breakout_down"
+    # Konsolidierung: enge Range
+    if range_size / prices[-1] < 0.01:
+        return "consolidation"
+    return "neutral"
+
+def calc_reversal_candle(prices: list) -> str:
+    """Erkennt Umkehrkerzen (Hammer / Shooting Star)"""
+    if len(prices) < 5:
+        return "neutral"
+    # Simuliere Kerze aus den letzten 3 Preisen
+    body = abs(prices[-1] - prices[-3])
+    total_range = max(prices[-3:]) - min(prices[-3:])
+    if total_range == 0:
+        return "neutral"
+    body_ratio = body / total_range
+    # Starke Aufwärtsbewegung nach unten = Hammer (bullisch)
+    if prices[-1] > prices[-3] and prices[-2] < min(prices[-3], prices[-1]) and body_ratio > 0.5:
+        return "hammer"
+    # Starke Abwärtsbewegung nach oben = Shooting Star (bärisch)
+    if prices[-1] < prices[-3] and prices[-2] > max(prices[-3], prices[-1]) and body_ratio > 0.5:
+        return "shooting_star"
+    return "neutral"
+
+def calc_trend_momentum(prices: list) -> float:
+    """Kombiniert kurzfristiges und langfristiges Momentum"""
+    if len(prices) < 20:
+        return 0.0
+    short_mom = (prices[-1] - prices[-5]) / prices[-5] * 100
+    long_mom = (prices[-1] - prices[-20]) / prices[-20] * 100
+    # Wenn beide in dieselbe Richtung: starkes Signal
+    if short_mom > 0 and long_mom > 0:
+        return (short_mom + long_mom) / 2
+    if short_mom < 0 and long_mom < 0:
+        return (short_mom + long_mom) / 2
+    return 0.0  # Gegenläufig = kein klares Signal
+
 # ── Brain (Lern-System) ────────────────────────────────
 class Brain:
     DEFAULT_WEIGHTS = {
@@ -167,6 +259,17 @@ class Brain:
         # Exit-Optimierung
         "hold_short": 1.0,       # Kurze Haltezeit war profitabel
         "hold_long": 1.0,        # Lange Haltezeit war profitabel
+        # Trend-Erkennung
+        "trend_ema_cross_up": 1.0,
+        "trend_ema_cross_down": 1.0,
+        "trend_higher_highs": 1.0,
+        "trend_lower_lows": 1.0,
+        "trend_breakout_up": 1.0,
+        "trend_breakout_down": 1.0,
+        "trend_reversal_bull": 1.0,
+        "trend_reversal_bear": 1.0,
+        "trend_consolidation": 1.0,
+        "trend_momentum_confirm": 1.0,
     }
 
     def __init__(self):
@@ -273,6 +376,7 @@ class Portfolio:
                 self.cash = data.get("cash", INITIAL_CAPITAL)
                 self.positions = data.get("positions", {})
                 self.trades = data.get("trades", [])
+                self.total_fees = data.get("total_fees", 0.0)
                 # Stelle sicher dass alle Positionen eine entry_time haben
                 for pair, pos in self.positions.items():
                     if "entry_time" not in pos:
@@ -287,7 +391,8 @@ class Portfolio:
                 json.dump({
                     "cash": self.cash,
                     "positions": self.positions,
-                    "trades": self.trades[-500:]
+                    "trades": self.trades[-500:],
+                    "total_fees": getattr(self, "total_fees", 0.0)
                 }, f, indent=2)
         except Exception as e:
             log.warning(f"Portfolio speichern fehlgeschlagen: {e}")
@@ -303,8 +408,10 @@ class Portfolio:
         invest = self.cash * min((confidence / 100) * INVEST_FRACTION, INVEST_FRACTION)
         if invest < 1.0 or self.cash < invest:
             return False, 0
-        units = invest / price
+        fee = invest * TRADING_FEE
+        units = (invest - fee) / price  # Fee reduziert gekaufte Menge
         self.cash -= invest
+        self.total_fees = getattr(self, "total_fees", 0.0) + fee
         if pair in self.positions:
             pos = self.positions[pair]
             total_units = pos["amount"] + units
@@ -336,9 +443,12 @@ class Portfolio:
             remaining = int(MIN_HOLD_SECONDS - hold_time)
             log.debug(f"⏳ {pair}: Mindest-Haltezeit nicht erreicht ({remaining}s verbleibend)")
             return False, 0, 0, {}
-        sale_value = pos["amount"] * price
-        pnl = sale_value - pos["amount"] * pos["avg_price"]
+        fee = pos["amount"] * price * TRADING_FEE
+        sale_value = pos["amount"] * price - fee  # Fee abgezogen
+        cost_basis = pos["amount"] * pos["avg_price"]
+        pnl = sale_value - cost_basis  # echter Gewinn nach Fees
         indicators = pos.get("indicators", {})
+        self.total_fees = getattr(self, "total_fees", 0.0) + fee
         self.cash += sale_value
         trade_entry = {
             "pair": pair, "type": "SELL", "price": price,
@@ -468,6 +578,69 @@ def analyze(pair: str, prices_data: dict, history: list, portfolio: Portfolio, b
     if vol_trend > 1.5:
         score *= 1.1  # 10% Boost wenn Volumen hoch
         indicators["volume_spike"] = True
+
+    # ── Trend-Erkennung ──
+    ema_cross = calc_ema_cross(history)
+    hh_ll = calc_higher_highs_lower_lows(history)
+    breakout = calc_breakout(history)
+    reversal = calc_reversal_candle(history)
+    trend_mom = calc_trend_momentum(history)
+
+    # EMA Kreuzung
+    if ema_cross == "cross_up":
+        score += 30 * w.get("trend_ema_cross_up", 1.0)
+        reasons.append("EMA Golden Cross")
+        indicators["trend_ema_cross_up"] = True
+    elif ema_cross == "cross_down":
+        score -= 30 * w.get("trend_ema_cross_down", 1.0)
+        reasons.append("EMA Death Cross")
+        indicators["trend_ema_cross_down"] = True
+    elif ema_cross == "above":
+        score += 10 * w.get("trend_ema_cross_up", 1.0)
+    elif ema_cross == "below":
+        score -= 10 * w.get("trend_ema_cross_down", 1.0)
+
+    # Höhere Hochs / Tiefere Tiefs
+    if hh_ll == "higher_highs":
+        score += 20 * w.get("trend_higher_highs", 1.0)
+        reasons.append("Höhere Hochs")
+        indicators["trend_higher_highs"] = True
+    elif hh_ll == "lower_lows":
+        score -= 20 * w.get("trend_lower_lows", 1.0)
+        reasons.append("Tiefere Tiefs")
+        indicators["trend_lower_lows"] = True
+
+    # Ausbrüche
+    if breakout == "breakout_up":
+        score += 35 * w.get("trend_breakout_up", 1.0)
+        reasons.append("Ausbruch nach oben!")
+        indicators["trend_breakout_up"] = True
+    elif breakout == "breakout_down":
+        score -= 35 * w.get("trend_breakout_down", 1.0)
+        reasons.append("Ausbruch nach unten!")
+        indicators["trend_breakout_down"] = True
+    elif breakout == "consolidation":
+        score *= w.get("trend_consolidation", 1.0) * 0.5  # Signal abschwächen
+        indicators["trend_consolidation"] = True
+
+    # Umkehrkerzen
+    if reversal == "hammer":
+        score += 25 * w.get("trend_reversal_bull", 1.0)
+        reasons.append("Hammer-Kerze")
+        indicators["trend_reversal_bull"] = True
+    elif reversal == "shooting_star":
+        score -= 25 * w.get("trend_reversal_bear", 1.0)
+        reasons.append("Shooting Star")
+        indicators["trend_reversal_bear"] = True
+
+    # Trend-Momentum Bestätigung
+    if abs(trend_mom) > 1.0:
+        boost = min(abs(trend_mom) * 2, 20)
+        if trend_mom > 0:
+            score += boost * w.get("trend_momentum_confirm", 1.0)
+            indicators["trend_momentum_confirm"] = True
+        else:
+            score -= boost * w.get("trend_momentum_confirm", 1.0)
 
     # ── 24h Change ──
     if change > 3:
@@ -652,6 +825,8 @@ class CryptoMindBot:
 
                 # ── Normales Signal ──
                 if conf >= MIN_CONFIDENCE and sig == "BUY":
+                    if len(self.portfolio.positions) >= MAX_POSITIONS:
+                        continue
                     success, invested = self.portfolio.buy(pair, price, conf, reason, result["indicators"])
                     if success:
                         log.info(f"🟢 BUY  {pair:<12} | €{invested:.2f} @ ${price:.4f} | {conf}% | {reason}")
@@ -682,9 +857,9 @@ class CryptoMindBot:
             await asyncio.sleep(max(0, CYCLE_SECONDS - elapsed))
 
     async def status_report(self):
-        """Sendet alle 15 Minuten einen kompakten Status-Report via Telegram"""
+        """Sendet jede Stunde einen kompakten Status-Report via Telegram"""
         while self.running:
-            await asyncio.sleep(15 * 60)
+            await asyncio.sleep(60 * 60)
             if not self.running:
                 break
             total = self.portfolio.total_value(self.prices)
@@ -702,10 +877,12 @@ class CryptoMindBot:
             best_txt = f"👍 <b>Bester Trade:</b> {best['pair']} {'+' if best['pnl']>=0 else ''}€{best['pnl']:.2f}" if best else "👍 Kein Trade"
             worst_txt = f"👎 <b>Schlechtester:</b> {worst['pair']} {'+' if worst['pnl']>=0 else ''}€{worst['pnl']:.2f}" if worst else "👎 Kein Trade"
 
+            total_fees = getattr(self.portfolio, "total_fees", 0.0)
             msg = (
                 f"⚠️ <b>CryptoMind Status-Report</b>\n\n"
                 f"💲 <b>Kapital:</b> €{total:.2f}\n"
                 f"{'📈' if pnl>=0 else '📉'} <b>PnL gesamt:</b> €{pnl:+.2f} ({pnl_pct:+.1f}%)\n"
+                f"💸 <b>Fees bezahlt:</b> €{total_fees:.2f}\n"
                 f"📊 <b>Winrate:</b> {self.brain.win_rate:.1f}% ({self.brain.total_trades} Trades)\n\n"
                 f"{best_txt}\n"
                 f"{worst_txt}"
@@ -720,6 +897,98 @@ class CryptoMindBot:
                 break
             await send_brain_backup(self.brain, self.portfolio)
 
+    async def telegram_commands(self):
+        """Lauscht auf Telegram-Befehle: /brain zum Brain-Import"""
+        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+            return
+        last_update_id = None
+        log.info("📱 Telegram-Befehlsempfänger aktiv")
+        while self.running:
+            try:
+                url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+                params = {"timeout": 30, "allowed_updates": ["message"]}
+                if last_update_id:
+                    params["offset"] = last_update_id + 1
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=35)) as resp:
+                        data = await resp.json()
+                for update in data.get("result", []):
+                    last_update_id = update["update_id"]
+                    msg = update.get("message", {})
+                    chat_id = str(msg.get("chat", {}).get("id", ""))
+                    if chat_id != TELEGRAM_CHAT_ID:
+                        continue
+                    text = msg.get("text", "")
+                    document = msg.get("document", {})
+
+                    # /status Befehl
+                    if text == "/status":
+                        total = self.portfolio.total_value(self.prices)
+                        pnl = total - INITIAL_CAPITAL
+                        fees = getattr(self.portfolio, "total_fees", 0.0)
+                        await send_telegram(
+                            f"📊 <b>Status auf Anfrage</b>\n"
+                            f"💲 Kapital: €{total:.2f}\n"
+                            f"{'📈' if pnl>=0 else '📉'} PnL: €{pnl:+.2f}\n"
+                            f"💸 Fees: €{fees:.2f}\n"
+                            f"🧠 Winrate: {self.brain.win_rate:.1f}% ({self.brain.total_trades} Trades)\n"
+                            f"📌 Positionen: {len(self.portfolio.positions)}"
+                        )
+
+                    # /brain Befehl – sendet aktuelle Brain-Datei
+                    elif text == "/brain":
+                        await send_brain_backup(self.brain, self.portfolio)
+
+                    # /reset Befehl – Brain zurücksetzen
+                    elif text == "/reset":
+                        self.brain.weights = self.brain.DEFAULT_WEIGHTS.copy()
+                        self.brain.save()
+                        await send_telegram("🔄 Brain-Gewichtungen zurückgesetzt!")
+                        log.info("🔄 Brain reset via Telegram")
+
+                    # Brain JSON Datei empfangen → importieren
+                    elif document.get("file_name", "").endswith(".json"):
+                        file_id = document["file_id"]
+                        try:
+                            async with aiohttp.ClientSession() as session:
+                                # Datei-URL abrufen
+                                r = await session.get(
+                                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile",
+                                    params={"file_id": file_id}
+                                )
+                                file_data = await r.json()
+                                file_path = file_data["result"]["file_path"]
+                                # Datei herunterladen
+                                r2 = await session.get(
+                                    f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
+                                )
+                                raw = await r2.read()
+                            brain_json = json.loads(raw)
+                            if "weights" in brain_json and "total_trades" in brain_json:
+                                # Neue Gewichtungen übernehmen
+                                self.brain.weights = {**self.brain.DEFAULT_WEIGHTS, **brain_json["weights"]}
+                                self.brain.total_trades = brain_json.get("total_trades", 0)
+                                self.brain.wins = brain_json.get("wins", 0)
+                                self.brain.losses = brain_json.get("losses", 0)
+                                self.brain.total_pnl = brain_json.get("total_pnl", 0.0)
+                                self.brain.history = brain_json.get("history", [])
+                                self.brain.save()
+                                await send_telegram(
+                                    f"✅ <b>Brain erfolgreich importiert!</b>\n"
+                                    f"🧠 {self.brain.total_trades} Trades geladen\n"
+                                    f"📊 Winrate: {self.brain.win_rate:.1f}%"
+                                )
+                                log.info(f"🧠 Brain importiert via Telegram: {self.brain.total_trades} Trades")
+                            else:
+                                await send_telegram("❌ Ungültige Brain-Datei!")
+                        except Exception as e:
+                            await send_telegram(f"❌ Import fehlgeschlagen: {e}")
+                            log.error(f"Brain import error: {e}")
+
+            except Exception as e:
+                log.warning(f"Telegram commands error: {e}")
+                await asyncio.sleep(5)
+
     async def run(self):
         self.running = True
         log.info("═" * 50)
@@ -730,7 +999,8 @@ class CryptoMindBot:
             self.connect_binance(),
             self.trading_loop(),
             self.status_report(),
-            self.brain_backup_loop()
+            self.brain_backup_loop(),
+            self.telegram_commands()
         )
 
 # ── Start ──────────────────────────────────────────────
