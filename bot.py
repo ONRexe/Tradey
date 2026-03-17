@@ -37,7 +37,8 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 PAIRS = [
     "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT",
     "DOGE/USDT", "ADA/USDT", "AVAX/USDT", "MATIC/USDT", "DOT/USDT",
-    "LINK/USDT", "LTC/USDT", "UNI/USDT", "ATOM/USDT", "TRX/USDT"
+    "LINK/USDT", "LTC/USDT", "UNI/USDT", "ATOM/USDT", "TRX/USDT",
+    "ARB/USDT", "OP/USDT", "INJ/USDT", "SUI/USDT", "APT/USDT", "SEI/USDT"
 ]
 SYMBOLS = {p: p.replace("/", "").lower() for p in PAIRS}
 
@@ -921,8 +922,27 @@ class CryptoMindBot:
                     text = msg.get("text", "")
                     document = msg.get("document", {})
 
+                    # /help Befehl
+                    if text == "/help":
+                        await send_telegram(
+                            "🤖 <b>CryptoMind Bot – Befehle</b>\n\n"
+                            "📊 <b>/status</b>\n"
+                            "  → Aktuellen Stand sofort abrufen\n\n"
+                            "🧠 <b>/brain</b>\n"
+                            "  → Brain-Datei jetzt senden\n\n"
+                            "📁 <b>Datei schicken (.json)</b>\n"
+                            "  → Brain importieren\n\n"
+                            "🔄 <b>/reset</b>\n"
+                            "  → Brain-Gewichtungen zurücksetzen\n\n"
+                            "📉 <b>/resetstats</b>\n"
+                            "  → Winrate & Trades auf 0 setzen\n"
+                            "  (Gewichtungen bleiben erhalten)\n\n"
+                            "ℹ️ Status-Report: stündlich automatisch\n"
+                            "ℹ️ Brain-Backup: alle 2 Stunden automatisch"
+                        )
+
                     # /status Befehl
-                    if text == "/status":
+                    elif text == "/status":
                         total = self.portfolio.total_value(self.prices)
                         pnl = total - INITIAL_CAPITAL
                         fees = getattr(self.portfolio, "total_fees", 0.0)
@@ -939,12 +959,28 @@ class CryptoMindBot:
                     elif text == "/brain":
                         await send_brain_backup(self.brain, self.portfolio)
 
-                    # /reset Befehl – Brain zurücksetzen
+                    # /reset Befehl – Brain-Gewichtungen zurücksetzen
                     elif text == "/reset":
                         self.brain.weights = self.brain.DEFAULT_WEIGHTS.copy()
                         self.brain.save()
                         await send_telegram("🔄 Brain-Gewichtungen zurückgesetzt!")
                         log.info("🔄 Brain reset via Telegram")
+
+                    # /resetstats Befehl – Winrate & Trades auf 0
+                    elif text == "/resetstats":
+                        self.brain.total_trades = 0
+                        self.brain.wins = 0
+                        self.brain.losses = 0
+                        self.brain.total_pnl = 0.0
+                        self.brain.history = []
+                        self.brain.save()
+                        await send_telegram(
+                            "🔄 <b>Trade-Statistiken zurückgesetzt!</b>\n"
+                            "📊 Winrate: 0%\n"
+                            "🏆 Wins: 0 | Losses: 0\n"
+                            "💡 Brain-Gewichtungen bleiben erhalten"
+                        )
+                        log.info("🔄 Trade stats reset via Telegram")
 
                     # Brain JSON Datei empfangen → importieren
                     elif document.get("file_name", "").endswith(".json"):
