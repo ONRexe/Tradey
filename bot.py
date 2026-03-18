@@ -17,12 +17,12 @@ import websockets
 import aiohttp
 
 # ── Konfiguration ──────────────────────────────────────
-INITIAL_CAPITAL    = 500.0        # Startkapital in €
+INITIAL_CAPITAL    = 2000.0       # Startkapital in €
 MIN_CONFIDENCE     = 65           # Mindest-Konfidenz für Trade (%)
 INVEST_FRACTION    = 0.25         # Max 25% des Kapitals pro Trade
-CYCLE_SECONDS      = 300          # Analyse-Zyklus 5 Minuten
-MIN_HOLD_SECONDS   = 900          # Mindest-Haltezeit 15 Minuten
-MAX_POSITIONS      = 5            # Max gleichzeitige Positionen
+CYCLE_SECONDS      = 120          # Analyse-Zyklus 2 Minuten
+MIN_HOLD_SECONDS   = 300          # Mindest-Haltezeit 5 Minuten
+MAX_POSITIONS      = 15           # Max gleichzeitige Positionen
 TRADING_FEE        = 0.001         # Binance Fee 0.1% pro Trade
 STOP_LOSS_PCT      = 0.03          # Stop-Loss bei 3% Verlust
 TAKE_PROFIT_PCT    = 0.05          # Take-Profit bei 5% Gewinn
@@ -35,10 +35,36 @@ TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
 PAIRS = [
-    "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT",
-    "DOGE/USDT", "ADA/USDT", "AVAX/USDT", "MATIC/USDT", "DOT/USDT",
-    "LINK/USDT", "LTC/USDT", "UNI/USDT", "ATOM/USDT", "TRX/USDT",
-    "ARB/USDT", "OP/USDT", "INJ/USDT", "SUI/USDT", "APT/USDT", "SEI/USDT"
+    # Large Cap
+    "BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT",
+    "ADA/USDT", "AVAX/USDT", "DOGE/USDT", "TRX/USDT", "DOT/USDT",
+    "MATIC/USDT", "LTC/USDT", "LINK/USDT", "ATOM/USDT", "UNI/USDT",
+    # Layer 2 & DeFi
+    "ARB/USDT", "OP/USDT", "MKR/USDT", "AAVE/USDT", "CRV/USDT",
+    "LDO/USDT", "RPL/USDT", "SNX/USDT", "BAL/USDT", "COMP/USDT",
+    # Layer 1 & Ecosystems
+    "INJ/USDT", "SUI/USDT", "APT/USDT", "SEI/USDT", "TIA/USDT",
+    "NEAR/USDT", "FTM/USDT", "ALGO/USDT", "VET/USDT", "HBAR/USDT",
+    "ICP/USDT", "ETC/USDT", "XLM/USDT", "EGLD/USDT", "THETA/USDT",
+    # Gaming & Metaverse
+    "AXS/USDT", "SAND/USDT", "MANA/USDT", "ENJ/USDT", "GALA/USDT",
+    "IMX/USDT", "MAGIC/USDT", "GMT/USDT", "STEPN/USDT",
+    # AI & Data
+    "FET/USDT", "AGIX/USDT", "OCEAN/USDT", "RNDR/USDT", "WLD/USDT",
+    "TAO/USDT", "GRT/USDT",
+    # Exchange Tokens
+    "OKB/USDT", "CRO/USDT", "KCS/USDT", "HT/USDT",
+    # Storage & Infrastructure
+    "FIL/USDT", "AR/USDT", "SC/USDT", "STORJ/USDT",
+    # Privacy
+    "XMR/USDT", "ZEC/USDT", "DASH/USDT",
+    # Oracle & Interoperability
+    "BAND/USDT", "API3/USDT", "ROSE/USDT", "QNT/USDT",
+    # Others trending
+    "CFX/USDT", "BLUR/USDT", "ID/USDT", "EDU/USDT", "MAV/USDT",
+    "PENDLE/USDT", "RDNT/USDT", "PYTH/USDT", "JTO/USDT", "MEME/USDT",
+    "ACE/USDT", "NFP/USDT", "XAI/USDT", "PIXEL/USDT", "PORTAL/USDT",
+    "STRK/USDT", "DYM/USDT", "ALT/USDT", "JUP/USDT", "WIF/USDT",
 ]
 SYMBOLS = {p: p.replace("/", "").lower() for p in PAIRS}
 
@@ -280,6 +306,7 @@ class Brain:
         self.losses = 0
         self.total_pnl = 0.0
         self.history = []
+        self.pair_stats = {}  # Pro-Paar Statistiken
         self.load()
 
     def load(self):
@@ -293,6 +320,7 @@ class Brain:
                 self.losses = data.get("losses", 0)
                 self.total_pnl = data.get("total_pnl", 0.0)
                 self.history = data.get("history", [])
+                self.pair_stats = data.get("pair_stats", {})
                 log.info(f"🧠 Brain geladen: {self.total_trades} Trades, Winrate: {self.win_rate:.1f}%")
         except Exception as e:
             log.warning(f"Brain laden fehlgeschlagen: {e}")
@@ -306,7 +334,8 @@ class Brain:
                     "wins": self.wins,
                     "losses": self.losses,
                     "total_pnl": self.total_pnl,
-                    "history": self.history[-200:]
+                    "history": self.history[-200:],
+                    "pair_stats": self.pair_stats
                 }, f, indent=2)
         except Exception as e:
             log.warning(f"Brain speichern fehlgeschlagen: {e}")
@@ -317,6 +346,20 @@ class Brain:
         for key in indicators:
             if key in self.weights:
                 self.weights[key] = max(0.1, min(3.0, self.weights[key] + delta))
+
+        # Pro-Paar Statistiken aktualisieren
+        if pair not in self.pair_stats:
+            self.pair_stats[pair] = {"trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "score": 1.0}
+        ps = self.pair_stats[pair]
+        ps["trades"] += 1
+        ps["pnl"] = round(ps["pnl"] + pnl, 4)
+        if won:
+            ps["wins"] += 1
+            ps["score"] = min(3.0, ps["score"] + 0.05)  # Paar-Score steigt
+        else:
+            ps["losses"] += 1
+            ps["score"] = max(0.1, ps["score"] - 0.04)  # Paar-Score sinkt
+        ps["winrate"] = round(ps["wins"] / ps["trades"] * 100, 1)
 
         # Lerne optimale Haltezeit
         if hold_seconds > 0:
@@ -649,6 +692,10 @@ def analyze(pair: str, prices_data: dict, history: list, portfolio: Portfolio, b
     elif change < -3:
         score -= 10
 
+    # Paar-Score Multiplikator (gute Paare bevorzugen)
+    pair_score = brain.pair_stats.get(pair, {}).get("score", 1.0)
+    score *= pair_score
+
     # Position management
     if has_pos and score > 10:
         score -= 15
@@ -744,7 +791,7 @@ class CryptoMindBot:
             try:
                 async with websockets.connect(url, ping_interval=20) as ws:
                     log.info("✅ Binance verbunden – empfange Echtzeit-Preise")
-                    await send_telegram("🟢 <b>CryptoMind Bot gestartet</b>\nVerbunden mit Binance · Paper Trading · €500 Startkapital")
+                    log.info("Bot gestartet – Telegram nur stündlicher Report aktiv")
                     async for msg in ws:
                         if not self.running:
                             break
@@ -814,14 +861,14 @@ class CryptoMindBot:
                             self.brain.save()
                             emoji = "🛑"
                             log.info(f"🛑 STOP {pair:<12} | €{value:.2f} | PnL: {pnl:+.2f}€ | {sl_pct*100:.1f}% Verlust")
-                            await send_telegram(f"🛑 <b>STOP-LOSS {pair}</b>\n💰 €{value:.2f} @ ${price:.4f}\n❌ PnL: €{pnl:+.2f} ({sl_pct*100:.1f}%)\n🧠 Brain lernt daraus")
+                            log.info(f"🛑 STOP-LOSS {pair} | PnL: {pnl:+.2f}€")
                         else:
                             for key in indicators:
                                 if key in self.brain.weights:
                                     self.brain.weights[key] = min(3.0, self.brain.weights[key] + 0.08)
                             self.brain.save()
                             log.info(f"🎯 TAKE {pair:<12} | €{value:.2f} | PnL: {pnl:+.2f}€ | +{sl_pct*100:.1f}% Gewinn")
-                            await send_telegram(f"🎯 <b>TAKE-PROFIT {pair}</b>\n💰 €{value:.2f} @ ${price:.4f}\n✅ PnL: €{pnl:+.2f} (+{sl_pct*100:.1f}%)\n🧠 Brain lernt daraus")
+                            log.info(f"🎯 TAKE-PROFIT {pair} | PnL: {pnl:+.2f}€")
                     continue
 
                 # ── Normales Signal ──
@@ -831,7 +878,7 @@ class CryptoMindBot:
                     success, invested = self.portfolio.buy(pair, price, conf, reason, result["indicators"])
                     if success:
                         log.info(f"🟢 BUY  {pair:<12} | €{invested:.2f} @ ${price:.4f} | {conf}% | {reason}")
-                        await send_telegram(f"🟢 <b>GEKAUFT {pair}</b>\n💰 €{invested:.2f} @ ${price:.4f}\n📊 {reason} | {conf}% Konfidenz\n🛑 Stop: -{STOP_LOSS_PCT*100:.0f}% | 🎯 Profit: +{TAKE_PROFIT_PCT*100:.0f}%")
+                        log.info(f"🟢 BUY {pair} | €{invested:.2f} @ ${price:.4f} | {conf}%")
 
                 elif conf >= MIN_CONFIDENCE and sig == "SELL":
                     pos = self.portfolio.positions.get(pair)
@@ -841,7 +888,7 @@ class CryptoMindBot:
                         self.brain.learn(indicators, pnl, pair, self.prices[pair]["current"], price, hold_secs)
                         emoji = "✅" if pnl >= 0 else "❌"
                         log.info(f"🔴 SELL {pair:<12} | €{value:.2f} | PnL: {pnl:+.2f}€ | {conf}% | {reason} | Haltezeit: {int(hold_secs)}s")
-                        await send_telegram(f"🔴 <b>VERKAUFT {pair}</b>\n💰 €{value:.2f} @ ${price:.4f}\n{emoji} PnL: €{pnl:+.2f}\n📊 {reason} | {int(hold_secs)}s gehalten")
+                        log.info(f"🔴 SELL {pair} | €{value:.2f} | PnL: {pnl:+.2f}€ | {int(hold_secs)}s")
 
             # Status alle 60 Zyklen loggen
             if hasattr(self, '_cycle_count'):
@@ -879,6 +926,18 @@ class CryptoMindBot:
             worst_txt = f"👎 <b>Schlechtester:</b> {worst['pair']} {'+' if worst['pnl']>=0 else ''}€{worst['pnl']:.2f}" if worst else "👎 Kein Trade"
 
             total_fees = getattr(self.portfolio, "total_fees", 0.0)
+            # Top 3 Paare nach PnL
+            pair_ranking = ""
+            if self.brain.pair_stats:
+                top3 = sorted(
+                    [(p, s) for p, s in self.brain.pair_stats.items() if s["trades"] >= 3],
+                    key=lambda x: x[1]["pnl"], reverse=True
+                )[:3]
+                if top3:
+                    pair_ranking = "\n\n🏆 <b>Top Paare:</b>\n" + "".join(
+                        f"  {p}: €{s['pnl']:+.2f} ({s['winrate']}%)\n" for p, s in top3
+                    )
+
             msg = (
                 f"⚠️ <b>CryptoMind Status-Report</b>\n\n"
                 f"💲 <b>Kapital:</b> €{total:.2f}\n"
@@ -887,6 +946,7 @@ class CryptoMindBot:
                 f"📊 <b>Winrate:</b> {self.brain.win_rate:.1f}% ({self.brain.total_trades} Trades)\n\n"
                 f"{best_txt}\n"
                 f"{worst_txt}"
+                f"{pair_ranking}"
             )
             await send_telegram(msg)
 
@@ -965,6 +1025,36 @@ class CryptoMindBot:
                         self.brain.save()
                         await send_telegram("🔄 Brain-Gewichtungen zurückgesetzt!")
                         log.info("🔄 Brain reset via Telegram")
+
+                    # /pairs Befehl – beste und schlechteste Paare
+                    elif text == "/pairs":
+                        stats = self.brain.pair_stats
+                        if not stats:
+                            await send_telegram("📊 Noch keine Paar-Statistiken vorhanden.")
+                        else:
+                            # Mindestens 3 Trades
+                            filtered = {p: s for p, s in stats.items() if s["trades"] >= 3}
+                            if not filtered:
+                                await send_telegram("📊 Noch zu wenig Trades pro Paar (min. 3 nötig).")
+                            else:
+                                by_pnl = sorted(filtered.items(), key=lambda x: x[1]["pnl"], reverse=True)
+                                by_wr = sorted(filtered.items(), key=lambda x: x[1]["winrate"], reverse=True)
+
+                                top5_pnl = by_pnl[:5]
+                                worst5_pnl = by_pnl[-5:]
+                                top5_wr = by_wr[:5]
+
+                                msg = "📊 <b>Paar-Auswertung</b>\n\n"
+                                msg += "🏆 <b>Bester PnL:</b>\n"
+                                for p, s in top5_pnl:
+                                    msg += f"  {p}: €{s['pnl']:+.2f} | {s['winrate']}% | {s['trades']} Trades\n"
+                                msg += "\n💔 <b>Schlechtester PnL:</b>\n"
+                                for p, s in worst5_pnl:
+                                    msg += f"  {p}: €{s['pnl']:+.2f} | {s['winrate']}% | {s['trades']} Trades\n"
+                                msg += "\n🎯 <b>Beste Winrate:</b>\n"
+                                for p, s in top5_wr:
+                                    msg += f"  {p}: {s['winrate']}% | €{s['pnl']:+.2f} | {s['trades']} Trades\n"
+                                await send_telegram(msg)
 
                     # /resetstats Befehl – Winrate & Trades auf 0
                     elif text == "/resetstats":
