@@ -1136,9 +1136,10 @@ from aiohttp import web
 async def create_dashboard_api(bot_instance):
     """Kleiner HTTP Server der Dashboard-Daten als JSON liefert"""
     async def handle_data(request):
-        # CORS für lokale HTML Datei
         headers = {
             "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
             "Content-Type": "application/json"
         }
         try:
@@ -1217,11 +1218,16 @@ async def create_dashboard_api(bot_instance):
             return web.Response(text=json.dumps({"error": str(e)}), headers=headers, status=500)
 
     async def handle_options(request):
-        return web.Response(headers={"Access-Control-Allow-Origin": "*"})
+        return web.Response(headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+        })
 
     app = web.Application()
     app.router.add_get("/data", handle_data)
     app.router.add_options("/data", handle_options)
+    app.router.add_get("/", lambda r: web.Response(text="CryptoMind Bot OK", headers={"Access-Control-Allow-Origin": "*"}))
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", 8080)
